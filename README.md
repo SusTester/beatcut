@@ -26,9 +26,15 @@ It is a static site: `index.html`, `style.css`, `app.js` and `icon.svg`. There i
 
 When the browser can record real H.264/AAC MP4 (Safari, and some Chrome builds), the output is MP4. Otherwise it is WebM (VP9 or VP8 with Opus).
 
+## Video frame capture and debugging
+
+Each hit's frames (2 to 4 at 12 fps) are captured once, before playback, and each frame is stored on its own canvas. BeatCut first seeks to each frame time and waits for `seeked` plus a presented frame (`requestVideoFrameCallback` if the browser has it, otherwise a double `requestAnimationFrame`). It then checks that each capture differs from the previous one using a 16×16 thumbnail, and retries or nudges the seek if they match. If captures still come back stale (iOS Safari can repaint an old frame after a seek, especially with sparse keyframes), BeatCut switches automatically to playback capture: it plays the video muted at 1× through each slice and grabs frames as they appear. While capturing, the source video is briefly shown in the preview area so Safari keeps decoding it.
+
+Open the app with **`?debug=1`** (for example `https://…/beatcut/?debug=1`) to see a contact sheet of every hit's captured frames. It shows the requested time, the captured time, how different each thumbnail is from the previous one (red means identical) and which capture mode was used. It also has buttons to recapture automatically or force playback mode. `?capture=play` or `?capture=seek` forces a mode (for testing).
+
 ## Tests
 
-`test/` holds a synthetic test video generator (`gen.py`) and Playwright scripts (`run.py`, `run2.py`, `run3.py`) that drive headless Chrome end to end.
+`test/` holds a synthetic test video generator (`gen.py`) and Playwright scripts (`run.py`, `run2.py`, `run3.py`, `frames_test.py`) that drive headless Chrome end to end.
 
 ## Known limitations
 

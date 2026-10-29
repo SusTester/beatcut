@@ -43,7 +43,7 @@
   </section>
 
   <div id="monitor" class="monitor hidden">
-    <div class="stage-wrap"><canvas id="stage" width="640" height="360"></canvas></div>
+    <div class="stage-wrap"><canvas id="stage" width="640" height="360"></canvas><video id="srcVideo" playsinline webkit-playsinline muted preload="auto" disablepictureinpicture></video></div>
     <div class="transport">
       <button id="btnPlay" class="btn primary" type="button">▶ Play</button>
       <button id="btnRender" class="btn accent" type="button">⏺ Render video</button>
@@ -97,12 +97,19 @@
     </div>
   </section>
 
+  <section id="secDebug" class="card hidden">
+    <h2>Debug: captured frames per hit</h2>
+    <p id="debugInfo" class="small muted"></p>
+    <div class="row wrap"><button id="btnDbgSeek" class="btn small" type="button">Recapture (auto)</button><button id="btnDbgPlay" class="btn small" type="button">Recapture (playback)</button></div>
+    <p class="small muted">Each row is one hit; thumbnails are its frames. Δ is the difference from the previous thumbnail (red = identical).</p>
+    <div id="debugSheet"></div>
+  </section>
+
   <section class="card about">
     <p class="small muted">BeatCut runs entirely in your browser. There are no uploads, no accounts, no analytics and no third-party code. Your camera recording and files are processed in memory and are discarded when you close the tab.</p>
   </section>
 </main>
 
-<video id="srcVideo" class="offscreen" playsinline muted preload="auto"></video>
 <div id="toast" class="toast hidden" role="status"></div>
 <script src="app.js"></script>
 </body>

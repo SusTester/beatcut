@@ -80,3 +80,16 @@ select{background:var(--card2);color:var(--text);border:1px solid var(--line);bo
 .toast.err{border-color:#e0244a}
 .about p{margin:0}
 @media (min-width:700px){ #stage{max-height:46vh} .cell{height:40px} }
+
+.stage-wrap{position:relative}
+#srcVideo{position:absolute;right:0;bottom:0;width:2px;height:2px;opacity:.01;pointer-events:none}
+.monitor.capturing #srcVideo{position:static;width:auto;height:auto;max-width:100%;max-height:36vh;opacity:1}
+.monitor.capturing #stage{display:none}
+@media (min-width:700px){.monitor.capturing #srcVideo{max-height:46vh}}
+#debugSheet{display:flex;flex-direction:column;gap:8px}
+.dbgrow{display:flex;gap:6px;align-items:flex-start;overflow-x:auto}
+.dbglab{min-width:120px;font-size:12px;font-weight:700}
+.dbgrow figure{margin:0;flex:none;width:112px}
+.dbgrow canvas{display:block;width:112px;border-radius:4px}
+.dbgrow figcaption{font-size:10px;color:var(--muted);font-variant-numeric:tabular-nums}
+.dbgrow figcaption.same{color:#ff4d6d}

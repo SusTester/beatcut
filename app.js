@@ -75,6 +75,7 @@
   let unlocked = false;
   function unlockAudio() {
     const c = audio();
+    blessVideo();
     if (unlocked && c.state === 'running') return;
     try { const b = c.createBuffer(1, 1, 22050); const s = c.createBufferSource(); s.buffer = b; s.connect(c.destination); s.start(0); unlocked = true; } catch (e) { /* ignore */ }
   }
@@ -314,66 +315,211 @@
   function usable(c) { return S.hits[c].filter((h) => h.on); }
 
   // ---------- video frames ----------
+  // Frames for every hit are captured up front so rendering never depends on live seeking.
+  // Strategy 1 ("seek"): seek, wait for 'seeked' + a presented frame (requestVideoFrameCallback or
+  // double rAF), snapshot into its own canvas, verify that it differs from the previous capture
+  // (retry / nudge if not). If captures look stale (Safari often paints an old frame after a seek,
+  // esp. with sparse keyframes), switch to strategy 2 ("play"): play the video muted at 1x through
+  // each slice window and grab frames as they are presented.
+  const params = new URLSearchParams(location.search);
+  const DEBUG = params.get('debug') === '1';
+  const FORCE_CAPTURE = params.get('capture'); // 'seek' | 'play' (testing)
   const srcVideo = $('#srcVideo');
   const stage = $('#stage'); const sctx = stage.getContext('2d');
-  const fcan = document.createElement('canvas'); const fctx = fcan.getContext('2d');
+  const fcan = document.createElement('canvas');
+  const sigCan = document.createElement('canvas'); sigCan.width = sigCan.height = 16;
+  const sigCtx = sigCan.getContext('2d', { willReadFrequently: true });
+  const SAME = 1.5; // mean abs pixel diff (0..255) on a 16x16 thumbnail below which two frames are "the same"
+  S.captureMode = FORCE_CAPTURE || null; S.captureStats = null;
 
-  async function prepVideo(url) {
-    srcVideo.muted = true; srcVideo.playsInline = true; srcVideo.src = url;
-    try { srcVideo.load(); } catch (e) { /* ignore */ }
-    const ok = await Promise.race([once(srcVideo, 'loadedmetadata', 10000), once(srcVideo, 'error', 10000).then(() => null)]);
-    if (!ok) { S.vw = 0; S.vh = 0; sizeStage(); return false; }
-    if (!isFinite(srcVideo.duration)) { // MediaRecorder webm has no duration; force the browser to find it
-      srcVideo.currentTime = 1e7; await once(srcVideo, 'durationchange', 3000); srcVideo.currentTime = 0; await once(srcVideo, 'seeked', 2000);
+  let blessed = false;
+  function blessVideo() { // iOS: play() inside a user gesture unlocks this element for later programmatic playback
+    if (blessed) return; blessed = true;
+    try { srcVideo.muted = true; const p = srcVideo.play(); if (p && p.catch) p.catch(() => {}); } catch (e) { /* ignore */ }
+  }
+  function showCapturing(on) { $('#monitor').classList.toggle('capturing', !!on); }
+  const raf2 = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+
+  async function prepVideo() {
+    const v = srcVideo;
+    if (v.readyState < 1) {
+      const ok = await Promise.race([once(v, 'loadedmetadata', 10000), once(v, 'error', 10000).then(() => null)]);
+      if (!ok) { S.vw = 0; S.vh = 0; sizeStage(); return false; }
     }
-    if (srcVideo.readyState < 2) await once(srcVideo, 'loadeddata', 5000);
-    try { await srcVideo.play(); srcVideo.pause(); } catch (e) { /* iOS needs this to paint frames; ok if it fails */ }
-    S.vw = srcVideo.videoWidth; S.vh = srcVideo.videoHeight; sizeStage();
+    if (!isFinite(v.duration)) { // MediaRecorder webm has no duration; force the browser to find it
+      v.currentTime = 1e7; await once(v, 'durationchange', 3000); v.currentTime = 0; await once(v, 'seeked', 2000);
+    }
+    await primeVideo();
+    S.vw = v.videoWidth; S.vh = v.videoHeight; sizeStage();
     return S.vw > 0;
+  }
+  // Play briefly (muted) so Safari actually decodes and paints frames, then rewind.
+  async function primeVideo() {
+    const v = srcVideo; v.muted = true;
+    try {
+      const p = v.play(); if (p && p.then) await Promise.race([p, sleep(2000)]);
+      const t0 = v.currentTime, w0 = performance.now();
+      while (v.currentTime === t0 && performance.now() - w0 < 1500) await sleep(30);
+    } catch (e) { /* autoplay refused; seeking still works on most browsers */ }
+    v.pause();
+    if (v.readyState < 2) await once(v, 'loadeddata', 4000);
   }
   function sizeStage() {
     const vw = S.vw || 16, vh = S.vh || 9; let w, h;
     if (vw >= vh) { w = STAGE_LONG; h = Math.round(STAGE_LONG * vh / vw); } else { h = STAGE_LONG; w = Math.round(STAGE_LONG * vw / vh); }
     w -= w % 2; h -= h % 2; stage.width = w; stage.height = h; fcan.width = w; fcan.height = h;
   }
-  let seekChain = Promise.resolve();
-  function seekTo(t) {
-    const v = srcVideo; const target = clamp(t, 0, Math.max(0, (isFinite(v.duration) ? v.duration : t + 1) - 0.04));
+  function waitPresented(timeout) { // resolves when a new video frame is presented (or after timeout)
+    const v = srcVideo;
     return new Promise((res) => {
-      let vfc = null; const cleanup = () => { clearTimeout(to); v.removeEventListener('seeked', onSeek); };
-      const done = () => { cleanup(); res(); };
-      const onSeek = () => {
-        if (v.requestVideoFrameCallback) { let fin = false; const f = () => { if (!fin) { fin = true; done(); } }; v.requestVideoFrameCallback(f); setTimeout(f, 80); } else setTimeout(done, 30);
-      };
-      const to = setTimeout(done, 2500);
-      v.addEventListener('seeked', onSeek);
-      if (Math.abs(v.currentTime - target) < 1e-3) { v.currentTime = target + 1e-3; } else v.currentTime = target;
-      void vfc;
+      let done = false; const f = (now, meta) => { if (!done) { done = true; res(meta || null); } };
+      if (v.requestVideoFrameCallback) { try { v.requestVideoFrameCallback(f); } catch (e) { /* ignore */ } }
+      setTimeout(() => f(), timeout);
     });
   }
-  async function grabFrame() {
+  async function seekPrecise(t) {
+    const v = srcVideo; const D = isFinite(v.duration) ? v.duration : t + 1;
+    let target = clamp(t, 0, Math.max(0, D - 0.05));
+    if (Math.abs(v.currentTime - target) < 1e-3) target = Math.min(D, target + 0.002);
+    const presented = waitPresented(v.requestVideoFrameCallback ? 300 : 60);
+    const seeked = once(v, 'seeked', 4000);
+    v.currentTime = target;
+    await seeked; await presented; await raf2();
+  }
+  function snapshot(want) { // each frame gets its own canvas (never a shared/reused surface)
     const v = srcVideo; const W = fcan.width, H = fcan.height;
-    const sc = Math.max(W / v.videoWidth, H / v.videoHeight); const dw = v.videoWidth * sc, dh = v.videoHeight * sc;
-    fctx.drawImage(v, (W - dw) / 2, (H - dh) / 2, dw, dh);
-    if (window.createImageBitmap) { try { return await createImageBitmap(fcan); } catch (e) { /* fall through */ } }
-    const c = document.createElement('canvas'); c.width = W; c.height = H; c.getContext('2d').drawImage(fcan, 0, 0); return c;
+    const c = document.createElement('canvas'); c.width = W; c.height = H; const x = c.getContext('2d');
+    const vw = v.videoWidth || W, vh = v.videoHeight || H; const sc = Math.max(W / vw, H / vh);
+    x.drawImage(v, (W - vw * sc) / 2, (H - vh * sc) / 2, vw * sc, vh * sc);
+    c._want = want; c._got = v.currentTime; c._sig = signature(c);
+    return c;
   }
-  function ensureFrames(hit) {
-    if (!S.vw) return Promise.resolve([]);
-    const n = clamp(Math.ceil(hit.dur * FRAME_FPS), 2, 4); const key = hit.t.toFixed(3) + ':' + n;
-    if (S.frameCache.has(key)) return S.frameCache.get(key);
-    const p = (seekChain = seekChain.then(async () => {
-      const fr = [];
-      for (let k = 0; k < n; k++) { await seekTo(hit.t + 0.01 + k / FRAME_FPS); fr.push(await grabFrame()); }
-      return fr;
-    }).catch(() => []));
-    S.frameCache.set(key, p); p.then((fr) => { hit.frames = fr; });
-    return p;
+  function signature(c) {
+    sigCtx.drawImage(c, 0, 0, 16, 16);
+    try { const d = sigCtx.getImageData(0, 0, 16, 16).data; const o = new Uint8Array(768); for (let i = 0, j = 0; i < d.length; i += 4) { o[j++] = d[i]; o[j++] = d[i + 1]; o[j++] = d[i + 2]; } return o; } catch (e) { return null; }
   }
-  async function extractAllFrames(onP) {
-    const token = ++S.extractToken; const list = allHits();
-    for (let i = 0; i < list.length; i++) { if (token !== S.extractToken) return; list[i].frames = await ensureFrames(list[i]); onP && onP((i + 1) / list.length); }
+  function sigDiff(a, b) { if (!a || !b) return 255; let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return s / a.length; }
+  const nFrames = (hit) => clamp(Math.ceil(hit.dur * FRAME_FPS), 2, 4);
+  const frameKey = (hit) => hit.t.toFixed(3) + ':' + nFrames(hit);
+  const frameTimes = (hit) => Array.from({ length: nFrames(hit) }, (_, k) => hit.t + 0.01 + k / FRAME_FPS);
+
+  async function captureSeekAll(list, token, onP) {
+    const out = new Map(); let prev = null, compared = 0, stale = 0, retries = 0;
+    for (let h = 0; h < list.length; h++) {
+      const hit = list[h]; const fr = [];
+      for (const t of frameTimes(hit)) {
+        if (token !== S.extractToken) return null;
+        await seekPrecise(t); let c = snapshot(t);
+        const ref = fr[fr.length - 1] || prev;
+        if (ref && Math.abs(ref._want - t) > 0.03 && sigDiff(c._sig, ref._sig) < SAME) {
+          retries++; await sleep(120); await raf2(); c = snapshot(t); // frame may not have been painted yet
+          if (sigDiff(c._sig, ref._sig) < SAME) { await seekPrecise(t + 0.034); c = snapshot(t); } // nudge
+        }
+        fr.push(c);
+      }
+      if (prev && hit.t - prev._want > 0.25) { compared++; if (sigDiff(fr[0]._sig, prev._sig) < SAME) stale++; }
+      prev = fr[0]; out.set(hit, fr); onP && onP((h + 1) / list.length);
+      if (compared >= 3 && stale === compared) return { stale: true, out, compared, staleN: stale, retries };
+    }
+    if (compared >= 2 && stale / compared > 0.5) return { stale: true, out, compared, staleN: stale, retries };
+    return { out, compared, staleN: stale, retries };
   }
+
+  async function capturePlayAll(list, token, onP) {
+    const v = srcVideo; v.muted = true;
+    const targets = [];
+    for (const hit of list) frameTimes(hit).forEach((t, k) => targets.push({ hit, k, t }));
+    targets.sort((a, b) => a.t - b.t);
+    const out = new Map(list.map((h) => [h, new Array(nFrames(h))]));
+    let i = 0;
+    const grab = (tg) => { out.get(tg.hit)[tg.k] = snapshot(tg.t); onP && onP(i / targets.length); };
+    while (i < targets.length) {
+      if (token !== S.extractToken) { v.pause(); return null; }
+      await seekPrecise(Math.max(0, targets[i].t - 0.15));
+      try { await v.play(); } catch (e) { grab(targets[i]); i++; continue; } // cannot play: take the seeked frame
+      await new Promise((res) => {
+        let finished = false, last = -1, lastWall = performance.now();
+        const finish = () => { if (!finished) { finished = true; clearInterval(wd); res(); } };
+        const step = (now, meta) => {
+          if (finished) return;
+          // use the more conservative clock: some engines report mediaTime ahead of the painted frame
+          const mt = meta && typeof meta.mediaTime === 'number' ? Math.min(meta.mediaTime, v.currentTime) : v.currentTime;
+          while (i < targets.length && targets[i].t <= mt + 0.005) { grab(targets[i]); i++; }
+          if (mt !== last) { last = mt; lastWall = performance.now(); }
+          const stuck = performance.now() - lastWall > 2500;
+          if (i >= targets.length || token !== S.extractToken) return finish();
+          if (v.ended || stuck) { grab(targets[i]); i++; return finish(); }
+          if (targets[i].t - mt > 0.7) return finish(); // big gap: seek ahead instead of playing through
+          if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(step); else requestAnimationFrame(() => step());
+        };
+        const wd = setInterval(() => step(), 400); // watchdog in case frame callbacks stop
+        if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(step); else requestAnimationFrame(() => step());
+      });
+      v.pause();
+    }
+    for (const [, fr] of out) for (let k = 0; k < fr.length; k++) if (!fr[k]) fr[k] = fr[k - 1] || fr.find(Boolean);
+    return out;
+  }
+
+  let extractChain = Promise.resolve();
+  function extractAllFrames(onP) {
+    const token = ++S.extractToken;
+    const run = async () => {
+      if (token !== S.extractToken) return;
+      const hits = allHits();
+      if (!S.vw) { hits.forEach((h) => (h.frames = [])); return; }
+      const seen = new Set();
+      const need = hits.filter((h) => { const k = frameKey(h); if (S.frameCache.has(k) || seen.has(k)) return false; seen.add(k); return true; }).sort((a, b) => a.t - b.t);
+      if (need.length) {
+        showCapturing(true);
+        try {
+          let res = null;
+          if ((S.captureMode || 'seek') === 'seek') {
+            res = await captureSeekAll(need, token, onP);
+            if (!res) return;
+            S.captureStats = { mode: 'seek', compared: res.compared, stale: res.staleN, retries: res.retries };
+            if (res.stale && FORCE_CAPTURE !== 'seek') {
+              console.warn('BeatCut: seek capture returned stale frames; switching to playback capture', res);
+              S.captureMode = 'play'; S.frameCache.clear(); res = null;
+              need.splice(0, need.length, ...hits.filter((h, i, a) => a.findIndex((x) => frameKey(x) === frameKey(h)) === i).sort((a, b) => a.t - b.t));
+            }
+          }
+          if (!res) {
+            const out = await capturePlayAll(need, token, onP); if (!out) return;
+            S.captureStats = Object.assign({}, S.captureStats, { mode: 'play' });
+            res = { out };
+          }
+          if (res.out) for (const [hit, fr] of res.out) S.frameCache.set(frameKey(hit), fr);
+        } finally { showCapturing(false); }
+      }
+      for (const h of hits) h.frames = S.frameCache.get(frameKey(h)) || [];
+      if (DEBUG) renderDebug();
+    };
+    const p = extractChain.then(run, run); extractChain = p.catch(() => {}); return p;
+  }
+
+  function renderDebug() {
+    const sec = $('#secDebug'); if (!sec) return; sec.classList.remove('hidden');
+    const box = $('#debugSheet'); box.innerHTML = '';
+    const st = S.captureStats || {};
+    $('#debugInfo').textContent = `capture: ${st.mode || '-'} · seek comparisons ${st.compared ?? '-'} / stale ${st.stale ?? '-'} / retries ${st.retries ?? '-'} · video ${S.vw}x${S.vh} · ${isFinite(srcVideo.duration) ? srcVideo.duration.toFixed(2) : '?'} s · rVFC ${'requestVideoFrameCallback' in HTMLVideoElement.prototype ? 'yes' : 'no'} · ${navigator.userAgent}`;
+    let prevSig = null;
+    for (const h of allHits().slice().sort((a, b) => a.t - b.t)) {
+      const row = document.createElement('div'); row.className = 'dbgrow';
+      const lab = document.createElement('div'); lab.className = 'dbglab'; lab.style.color = COLOR[h.cls]; lab.textContent = `${LABEL[h.cls]} #${h.n} @ ${h.t.toFixed(3)}s`; row.appendChild(lab);
+      (h.frames || []).forEach((f, k) => {
+        const cell = document.createElement('figure'); const c = document.createElement('canvas'); c.width = 112; c.height = Math.round(112 * f.height / f.width);
+        c.getContext('2d').drawImage(f, 0, 0, c.width, c.height);
+        const d = sigDiff(f._sig, prevSig); prevSig = f._sig;
+        const cap = document.createElement('figcaption'); cap.textContent = `want ${f._want != null ? f._want.toFixed(3) : '?'} got ${f._got != null ? f._got.toFixed(3) : '?'} Δ${d.toFixed(1)}`;
+        if (d < SAME) cap.className = 'same';
+        cell.append(c, cap); row.appendChild(cell); void k;
+      });
+      box.appendChild(row);
+    }
+  }
+  $('#btnDbgPlay') && ($('#btnDbgPlay').onclick = () => { S.captureMode = 'play'; S.frameCache.clear(); extractAllFrames(); });
+  $('#btnDbgSeek') && ($('#btnDbgSeek').onclick = () => { S.captureMode = FORCE_CAPTURE || null; S.frameCache.clear(); extractAllFrames(); });
 
   // ---------- drawing ----------
   function drawHitFrame(hit, dt, step) {
@@ -663,14 +809,19 @@
   // ---------- loading a source ----------
   async function loadSource(blob, name) {
     if (S.busy) return; S.busy = true; stopEngine(); updateTransport();
+    // Set the source and start a muted play() synchronously, while we may still be inside the user gesture (iOS).
+    if (S.url) URL.revokeObjectURL(S.url);
+    S.url = URL.createObjectURL(blob); S.blob = blob; S.name = name || 'video';
+    S.vw = S.vh = 0; S.ready = false; S.error = null; S.captureMode = FORCE_CAPTURE || null; S.captureStats = null;
+    srcVideo.muted = true; srcVideo.playsInline = true; srcVideo.src = S.url;
+    try { srcVideo.load(); const pp = srcVideo.play(); if (pp && pp.catch) pp.catch(() => {}); } catch (e) { /* ignore */ }
+    $('#monitor').classList.remove('hidden'); showCapturing(true);
     $('#secHits').classList.remove('hidden'); $('#secOut').classList.add('hidden');
     S.extractToken++; S.frameCache.clear(); S.sel = null; S._hitState = {};
     try {
       if (blob.size > 400 * 1048576) toast('Large video: analysis may be slow or run out of memory on phones. Try a shorter clip.', true);
-      if (S.url) URL.revokeObjectURL(S.url);
-      S.url = URL.createObjectURL(blob); S.blob = blob; S.name = name || 'video';
       setProgress(0.03, 'Loading video…');
-      const hasVideo = await prepVideo(S.url);
+      const hasVideo = await prepVideo();
       setProgress(0.08, 'Decoding audio…');
       let buf = null;
       try { buf = await decode(await blobToArrayBuffer(blob)); }
@@ -681,6 +832,7 @@
       }
       if (!buf || buf.duration < 0.3) throw new Error('No usable audio found in this video.');
       S.buffer = buf; S.sr = buf.sampleRate; S.mono = mixdown(buf);
+      showCapturing(false); srcVideo.pause();
       setProgress(0.5, 'Finding drum hits…');
       S.odf = await computeODF(S.mono, S.sr, (p) => setProgress(0.5 + 0.25 * p));
       detect();
@@ -694,7 +846,7 @@
       toast(`Found ${S.onsets.length} hits · using ${S.hits.kick.length} kick, ${S.hits.snare.length} snare, ${S.hits.hat.length} hat` + (n ? '. Press Play!' : ''));
       S.ready = true;
     } catch (e) {
-      console.error(e); setProgress(null); toast((e && e.message) || 'Could not analyze this video.', true);
+      console.error(e); setProgress(null); showCapturing(false); toast((e && e.message) || 'Could not analyze this video.', true);
       S.error = String((e && e.message) || e);
     } finally { S.busy = false; updateTransport(); }
   }
