@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0b12">
+<meta name="description" content="BeatCut turns sounds from any video into a drum-beat music video. Runs 100% in your browser.">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob: mediastream:; connect-src 'self' blob: data:; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>BeatCut · turn any video into a beat</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><img src="icon.svg" alt="" class="logo"> BeatCut</div>
+  <div class="privacy" title="No uploads, no analytics, no servers. Recording, analysis and rendering all happen on this device.">🔒 Your video never leaves your device</div>
+</header>
+
+<main>
+  <section id="secSource" class="card">
+    <h2><span class="num">1</span> Capture sounds</h2>
+    <p class="hint">Record your surroundings (tap a table, clap, close a door, shake keys) or pick a video you already have. BeatCut finds the drum-like hits and cuts them into a beat.</p>
+    <div class="row">
+      <button id="btnCamera" class="btn primary big" type="button">● Record</button>
+      <label class="btn big" for="fileInput" id="lblFile">📁 Choose video</label>
+      <input id="fileInput" type="file" accept="video/*" class="visually-hidden">
+    </div>
+    <div id="recorder" class="recorder hidden">
+      <div class="cam-wrap">
+        <video id="camPreview" playsinline muted autoplay></video>
+        <div class="rec-badge hidden" id="recBadge"><span class="rec-dot"></span><span id="recTimer">0:00</span></div>
+      </div>
+      <div class="row">
+        <button id="btnRecStart" class="btn danger" type="button">● Start</button>
+        <button id="btnRecStop" class="btn danger hidden" type="button">■ Stop</button>
+        <button id="btnFlip" class="btn" type="button">⟲ Flip</button>
+        <button id="btnRecCancel" class="btn ghost" type="button">Cancel</button>
+      </div>
+      <p class="hint small">Tip: 10 to 30 seconds with lots of distinct hits works best. Low thuds become kicks, slaps and claps become snares, and ticks or rattles become hi-hats.</p>
+    </div>
+    <div id="sourceInfo" class="muted small"></div>
+  </section>
+
+  <div id="monitor" class="monitor hidden">
+    <div class="stage-wrap"><canvas id="stage" width="640" height="360"></canvas></div>
+    <div class="transport">
+      <button id="btnPlay" class="btn primary" type="button">▶ Play</button>
+      <button id="btnRender" class="btn accent" type="button">⏺ Render video</button>
+      <span id="transportInfo" class="muted small"></span>
+    </div>
+  </div>
+
+  <section id="secHits" class="card hidden">
+    <h2><span class="num">2</span> Drum hits</h2>
+    <div id="progress" class="progress hidden"><div class="bar"><i></i></div><span class="label"></span></div>
+    <canvas id="wave" class="wave" height="110"></canvas>
+    <p class="hint small">Tap a marker (or a chip below) to hear and see that hit. Untick a chip to leave it out of the beat.</p>
+    <div id="hitChips" class="chips"></div>
+    <details class="more">
+      <summary>Detection settings</summary>
+      <div class="ctl"><label for="rngSens">Sensitivity</label><input id="rngSens" type="range" min="0" max="1" step="0.05" value="0.5"><output id="outSens">50%</output></div>
+      <div class="ctl"><label for="rngPer">Hits per sound</label><input id="rngPer" type="range" min="1" max="12" step="1" value="6"><output id="outPer">6</output></div>
+      <div class="ctl"><label for="rngLen">Slice length</label><input id="rngLen" type="range" min="0.5" max="2" step="0.05" value="1"><output id="outLen">100%</output></div>
+    </details>
+  </section>
+
+  <section id="secBeat" class="card hidden">
+    <h2><span class="num">3</span> Beat</h2>
+    <div id="grid" class="grid" aria-label="16-step pattern"></div>
+    <div class="row wrap">
+      <button id="btnDefault" class="btn small" type="button">Default groove</button>
+      <button id="btnRandom" class="btn small" type="button">🎲 Randomize</button>
+      <button id="btnClear" class="btn small ghost" type="button">Clear</button>
+    </div>
+    <div class="ctl"><label for="rngBpm">Tempo</label><input id="rngBpm" type="range" min="60" max="180" step="1" value="100"><output id="outBpm">100 BPM</output></div>
+    <div class="ctl"><label for="rngSwing">Swing</label><input id="rngSwing" type="range" min="0" max="0.5" step="0.01" value="0"><output id="outSwing">0%</output></div>
+    <div class="ctl"><label for="selBars">Length</label>
+      <select id="selBars"><option value="1">1 bar</option><option value="2">2 bars</option><option value="4" selected>4 bars</option><option value="8">8 bars</option><option value="16">16 bars</option></select>
+      <output id="outDur"></output></div>
+    <div class="toggles">
+      <label><input type="checkbox" id="chkVary" checked> Vary hits</label>
+      <label><input type="checkbox" id="chkFill" checked> Fill on last bar</label>
+      <label><input type="checkbox" id="chkFx" checked> Flash and zoom</label>
+      <label><input type="checkbox" id="chkEq" checked> Punch EQ</label>
+      <label><input type="checkbox" id="chkLoop" checked> Loop preview</label>
+    </div>
+  </section>
+
+  <section id="secOut" class="card hidden">
+    <h2><span class="num">4</span> Your music video</h2>
+    <video id="outVideo" controls playsinline></video>
+    <div class="row wrap">
+      <a id="lnkDownload" class="btn primary" download="beatcut.webm" href="#">⬇ Download</a>
+      <button id="btnShare" class="btn hidden" type="button">Share…</button>
+      <span id="outInfo" class="muted small"></span>
+    </div>
+  </section>
+
+  <section class="card about">
+    <p class="small muted">BeatCut runs entirely in your browser. There are no uploads, no accounts, no analytics and no third-party code. Your camera recording and files are processed in memory and are discarded when you close the tab.</p>
+  </section>
+</main>
+
+<video id="srcVideo" class="offscreen" playsinline muted preload="auto"></video>
+<div id="toast" class="toast hidden" role="status"></div>
+<script src="app.js"></script>
+</body>
+</html>
