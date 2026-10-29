@@ -93,3 +93,9 @@ select{background:var(--card2);color:var(--text);border:1px solid var(--line);bo
 .dbgrow canvas{display:block;width:112px;border-radius:4px}
 .dbgrow figcaption{font-size:10px;color:var(--muted);font-variant-numeric:tabular-nums}
 .dbgrow figcaption.same{color:#ff4d6d}
+:root{--clap:#c77dff;--hitom:#95e06c;--lotom:#2bb673;--rim:#ff9f1c}
+.grid .rl.clap{color:var(--clap)}.grid .rl.hitom{color:var(--hitom)}.grid .rl.lotom{color:var(--lotom)}.grid .rl.rim{color:var(--rim)}
+.cell.on.clap{background:var(--clap)}.cell.on.hitom{background:var(--hitom)}.cell.on.lotom{background:var(--lotom)}.cell.on.rim{background:var(--rim)}
+.clap .lab,.chip.clap .pv b{color:var(--clap)}.hitom .lab,.chip.hitom .pv b{color:var(--hitom)}.lotom .lab,.chip.lotom .pv b{color:var(--lotom)}.rim .lab,.chip.rim .pv b{color:var(--rim)}
+.cell{height:30px}
+.grid .rl{font-size:11.5px;white-space:nowrap}

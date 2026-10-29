@@ -2,14 +2,16 @@
 'use strict';
 (function () {
   const $ = (s) => document.querySelector(s);
-  const CLASSES = ['kick', 'snare', 'hat'];
-  const LABEL = { kick: 'Kick', snare: 'Snare', hat: 'Hi-hat' };
-  const COLOR = { kick: '#ff4d6d', snare: '#ffd166', hat: '#4cc9f0' };
-  const PRIO = { kick: 3, snare: 2, hat: 1 };
-  const BASE_DUR = { kick: 0.32, snare: 0.26, hat: 0.12 };
-  const LEVEL = { kick: 1.0, snare: 0.9, hat: 0.6 };
+  const CLASSES = ['kick', 'snare', 'hat', 'clap', 'hitom', 'lotom', 'rim'];
+  const AUX = ['clap', 'hitom', 'lotom', 'rim'];
+  const LABEL = { kick: 'Kick', snare: 'Snare', hat: 'Hi-hat', clap: 'Clap', hitom: 'Hi Tom', lotom: 'Lo Tom', rim: 'Rim' };
+  const COLOR = { kick: '#ff4d6d', snare: '#ffd166', hat: '#4cc9f0', clap: '#c77dff', hitom: '#95e06c', lotom: '#2bb673', rim: '#ff9f1c' };
+  const PRIO = { kick: 7, snare: 6, clap: 5, lotom: 4, hitom: 3, rim: 2, hat: 1 };
+  const BASE_DUR = { kick: 0.32, snare: 0.26, hat: 0.12, clap: 0.22, hitom: 0.30, lotom: 0.36, rim: 0.10 };
+  const LEVEL = { kick: 1.0, snare: 0.9, hat: 0.6, clap: 0.85, hitom: 0.9, lotom: 0.95, rim: 0.6 };
+  const perClass = (fn) => Object.fromEntries(CLASSES.map((c) => [c, fn(c)]));
   const FRAME_FPS = 12;
-  const STAGE_LONG = 640;
+  const STAGE_LONG = 576; // frames are kept in memory per hit; keeps 7 rows of hits phone-friendly
   const MAX_ANALYZE_SEC = 180;
   const MAX_REC_SEC = 180;
   const ua = navigator.userAgent;
@@ -18,7 +20,7 @@
 
   const S = {
     blob: null, url: null, name: '', buffer: null, mono: null, sr: 44100, odf: null,
-    onsets: [], hits: { kick: [], snare: [], hat: [] }, frameCache: new Map(), vw: 0, vh: 0,
+    onsets: [], hits: perClass(() => []), frameCache: new Map(), vw: 0, vh: 0,
     pattern: null, fillPattern: null, bpm: 100, bars: 4, swing: 0, vary: true, fill: true, fx: true, eq: true, loop: true,
     sens: 0.5, perClass: 6, lenMul: 1, busy: false, extractToken: 0, sel: null, play: null, lastOut: null,
   };
@@ -233,11 +235,39 @@
     const a = Math.max(0, off + (N_FFT >> 2)), b = Math.min(x.length, off + N_FFT + Math.round(sr * 0.01));
     let best = 0, bi = a;
     for (let s = a; s < b; s += blk) { const m = peakRange(x, s, s + blk); if (m > best) { best = m; bi = s; } }
-    let s = bi; const thr = best * 0.22;
-    while (s - blk >= a - Math.round(sr * 0.02) && s - blk >= 0 && peakRange(x, s - blk, s) > thr) s -= blk;
+    let s = bi; const thr = best * 0.22, lim = Math.max(0, a - Math.round(sr * 0.04));
+    const nref = peakRange(x, Math.max(0, lim - Math.round(sr * 0.03)), lim); // local noise level
+    for (let pass = 0; pass < 4; pass++) {
+      while (s - blk >= lim && peakRange(x, s - blk, s) > thr) s -= blk;
+      // multi-burst sounds (claps): an earlier strong burst within 15 ms belongs to the same hit
+      let e = -1; for (let q = s - blk; q >= Math.max(lim, s - Math.round(sr * 0.015)); q -= blk) if (peakRange(x, q, q + blk) > Math.max(best * 0.45, nref * 2.5)) { e = q; break; }
+      if (e < 0) break; s = e;
+    }
     return Math.max(0, s - Math.round(sr * 0.002));
   }
 
+  function peakPitch(pw, binHz, lo, hi) { // strongest partial in [lo,hi] Hz (parabolic interpolation) + its prominence
+    const a = Math.max(2, Math.round(lo / binHz)), b = Math.min(pw.length - 2, Math.round(hi / binHz));
+    let bi = a, bm = 0, sum = 0;
+    for (let k = a; k <= b; k++) { sum += pw[k]; if (pw[k] > bm) { bm = pw[k]; bi = k; } }
+    const l = Math.log(pw[bi - 1] + 1e-18), c = Math.log(pw[bi] + 1e-18), r = Math.log(pw[bi + 1] + 1e-18);
+    const d = (l - 2 * c + r) !== 0 ? clamp(0.5 * (l - r) / (l - 2 * c + r), -0.5, 0.5) : 0;
+    return { f: (bi + d) * binHz, prom: bm / (sum / (b - a + 1) + 1e-18) };
+  }
+  function burstCount(x, sr, o) { // claps = several noise bursts within ~40 ms (measured on a 2nd-difference high-pass so low tones don't ripple)
+    const blk = Math.max(2, Math.round(sr * 0.002)), nB = Math.round(0.045 * sr / blk), env = [];
+    for (let i = 0; i < nB; i++) {
+      let m = 0; const a = o + (i - 2) * blk;
+      for (let j = Math.max(2, a); j < Math.min(x.length, a + blk); j++) { const v = Math.abs(x[j] - 2 * x[j - 1] + x[j - 2]); if (v > m) m = v; }
+      env.push(m);
+    }
+    const mx = Math.max(...env, 1e-9); let count = 0, lastPeak = -10, minSince = mx;
+    for (let i = 1; i < env.length - 1; i++) {
+      minSince = Math.min(minSince, env[i]);
+      if (env[i] >= env[i - 1] && env[i] >= env[i + 1] && env[i] > 0.35 * mx && i - lastPeak >= 4 && (count === 0 || minSince < 0.5 * env[i])) { count++; lastPeak = i; minSince = env[i]; }
+    }
+    return Math.max(1, count);
+  }
   function features(x, sr, o) {
     const pw = new Float64Array(N_FFT / 2);
     spectrumAt(x, o - (N_FFT >> 3), pw);
@@ -250,11 +280,19 @@
     let lg = 0, ar = 0, n = 0; const fa = Math.round(150 / binHz), fb = Math.min(N_FFT / 2, Math.round(12000 / binHz));
     for (let k = fa; k < fb; k++) { const p = pw[k] + 1e-12; lg += Math.log(p); ar += p; n++; }
     const flat = n ? Math.exp(lg / n) / (ar / n) : 0;
+    const p1 = peakPitch(pw, binHz, 40, 1000);
+    const pw2 = new Float64Array(N_FFT / 2); spectrumAt(x, o + Math.round(sr * 0.05), pw2);
+    const p2 = peakPitch(pw2, binHz, 40, 1000);
     const pre = rmsRange(x, o - sr * 0.06, o - sr * 0.004), post = rmsRange(x, o, o + sr * 0.05);
+    const tail = rmsRange(x, o + sr * 0.06, o + sr * 0.16);
+    const nf = Math.min(pre, S.noiseFloor || 0);
     const db = 20 * Math.log10((post + 1e-9) / (pre + 1e-9));
-    return { eLow, eMid, eHigh, centroid, flat, clean: clamp((db - 3) / 24, 0, 1) };
+    return { eLow, eMid, eHigh, centroid, flat, pitch: p1.f, pitch2: p2.f, prom: p1.prom, decay: Math.sqrt(Math.max(0, tail * tail - nf * nf)) / (Math.sqrt(Math.max(0, post * post - nf * nf)) + 1e-9), // noise-floor corrected
+      burst: burstCount(x, sr, o), clean: clamp((db - 3) / 24, 0, 1) };
   }
 
+  // Scores for the base sound types; 'tom' is later split into hitom / lotom by relative pitch.
+  const SCORE_TYPES = ['kick', 'snare', 'hat', 'clap', 'tom', 'rim'];
   function classify(list) {
     const L = list.map((f) => [Math.log(f.eLow + 1e-12), Math.log(f.eMid + 1e-12), Math.log(f.eHigh + 1e-12)]);
     const n = L.length; const mean = [0, 0, 0], sd = [1, 1, 1];
@@ -264,15 +302,35 @@
     list.forEach((f, i) => {
       const rel = n >= 4 ? L[i].map((v, b) => (v - mean[b]) / sd[b]) : [0, 0, 0];
       const lc = Math.log2(Math.max(20, f.centroid) / 1000); // 0 at 1 kHz
+      const tonal = clamp(Math.log10(f.prom + 1e-9) - 1, -1, 1.5); // strong single partial => pitched
+      const bursty = clamp(f.burst - 1, 0, 2);
+      const longish = clamp((f.decay - 0.2) * 3, -1, 1); // ring-out after 60 ms
+      const shortish = clamp((0.18 - f.decay) * 6, -1.5, 1.5);
+      const sweep = Math.log2(Math.max(20, f.pitch) / Math.max(20, f.pitch2)); // kicks drop in pitch fast
       const sc = {
-        kick: 0.6 * rel[0] - 0.3 * rel[2] + clamp(-(lc + 1.4) / 1.0, -2, 2),
-        snare: 0.6 * rel[1] + clamp(1 - Math.abs(lc - 0.3) / 1.4, -2, 1.2) + 0.8 * (f.flat - 0.15),
+        kick: 0.6 * rel[0] - 0.3 * rel[2] + clamp(-(lc + 1.4) / 1.0, -2, 2) + clamp((105 - f.pitch2) / 30, -1.5, 1) + 0.5 * clamp(sweep - 0.4, -0.5, 1),
+        snare: 0.6 * rel[1] + clamp(1 - Math.abs(lc - 0.3) / 1.4, -2, 1.2) + 0.8 * (f.flat - 0.15) + clamp((f.flat - 0.03) * 15, -1, 0.6) - 0.9 * bursty - 0.15 * tonal,
         hat: 0.6 * rel[2] - 0.3 * rel[0] + clamp((lc - 1.9) / 1.0, -2, 2),
+        clap: 1.3 * bursty + 1.2 * (f.flat - 0.2) + clamp(1 - Math.abs(lc - 0.8) / 1.2, -2, 1) - 0.4 * tonal - 0.6,
+        tom: 0.9 * tonal + clamp(1 - Math.abs(Math.log2(Math.max(20, f.pitch2) / 190)) / 1.2, -1.5, 1) + 0.6 * longish
+          + clamp((f.pitch2 - 95) / 25, -2, 0.5) - 0.8 * clamp(sweep - 0.4, 0, 1) + clamp(-(lc + 0.6), -1.5, 0.5) + clamp((0.03 - f.flat) * 20, -1.5, 0.4) - 0.3,
+        rim: 1.0 * shortish + clamp(1 - Math.abs(lc - 0.7) / 1.0, -2, 1) + 0.5 * tonal + 1.2 * (0.2 - f.flat) - 0.6 * bursty - 0.2,
       };
       f.scores = sc;
-      const order = CLASSES.slice().sort((a, b) => sc[b] - sc[a]);
+      const order = SCORE_TYPES.slice().sort((a, b) => sc[b] - sc[a]);
       f.cls = order[0]; f.margin = clamp((sc[order[0]] - sc[order[1]]) / 2, 0, 1);
     });
+  }
+  // Split tom-like hits into high/low by pitch relative to each other: at the largest pitch gap
+  // (if clearly bimodal, >= 0.35 octave) otherwise at the median, so both rows get hits.
+  function splitToms(toms) {
+    const s = toms.slice().sort((a, b) => b.pitch2 - a.pitch2); // high -> low
+    if (s.length < 2) return { hi: s.filter((f) => f.pitch2 >= 160), lo: s.filter((f) => f.pitch2 < 160) };
+    let cut = Math.floor(s.length / 2), gap = 0;
+    const minSide = Math.max(1, Math.ceil(s.length * 0.2)); // a lone outlier must not take a whole row
+    for (let i = minSide; i <= s.length - minSide; i++) { const g = Math.log2(s[i - 1].pitch2 / Math.max(20, s[i].pitch2)); if (g > gap) { gap = g; cut = i; } }
+    if (gap < 0.35) cut = Math.floor(s.length / 2);
+    return { hi: s.slice(0, cut), lo: s.slice(cut) };
   }
 
   function detect() {
@@ -283,6 +341,7 @@
       for (const i of idx) { if (keep.length >= 9) break; if (O.rms[i] < 1e-4) break; if (keep.every((k) => Math.abs(k - i) > 15)) keep.push(i); }
       ons = keep.sort((a, b) => a - b).map((f) => ({ f, strength: 0.3 }));
     }
+    { const r = Array.from(O.rms).sort((a, b) => a - b); S.noiseFloor = r[Math.floor(r.length * 0.1)] || 0; }
     const list = [];
     for (const o of ons) {
       const s = refineOnset(x, sr, o.f, O.hop);
@@ -291,15 +350,29 @@
     }
     classify(list);
     list.forEach((f, i) => { f.id = i; f.rank = 0.4 * f.strength + 0.4 * f.clean + 0.2 * f.margin; });
+    const byRank = (a, b) => b.rank - a.rank;
+    const toms = splitToms(list.filter((f) => f.cls === 'tom'));
+    toms.hi.forEach((f) => (f.cls = 'hitom')); toms.lo.forEach((f) => (f.cls = 'lotom'));
     S.onsets = list;
-    const hits = { kick: [], snare: [], hat: [] };
+    const hits = perClass(() => []);
     for (const c of CLASSES) {
-      let pool = list.filter((f) => f.cls === c).sort((a, b) => b.rank - a.rank).slice(0, S.perClass);
-      let borrowed = false;
-      if (!pool.length && list.length) { // make sure every row has something to play
-        pool = list.slice().sort((a, b) => b.scores[c] - a.scores[c]).slice(0, Math.min(2, list.length)); borrowed = true;
+      const cap = AUX.includes(c) ? Math.min(S.perClass, 4) : S.perClass; // aux rows keep fewer hits (memory on phones)
+      hits[c] = list.filter((f) => f.cls === c).sort(byRank).slice(0, cap).map((f, i) => makeHit(f, c, i, false));
+    }
+    // make sure every row has something to play
+    if (list.length) {
+      if (!hits.hitom.length && hits.lotom.length) hits.hitom = hits.lotom.slice(0, 2).map((h, i) => Object.assign(makeHit(h._f, 'hitom', i, true), { rate: 1.33 }));
+      else if (!hits.lotom.length && hits.hitom.length) hits.lotom = hits.hitom.slice(0, 2).map((h, i) => Object.assign(makeHit(h._f, 'lotom', i, true), { rate: 0.75 }));
+      else if (!hits.hitom.length && !hits.lotom.length) {
+        const best = list.slice().sort((a, b) => b.scores.tom - a.scores.tom).slice(0, 2).sort((a, b) => b.pitch2 - a.pitch2);
+        hits.hitom = [Object.assign(makeHit(best[0], 'hitom', 0, true), best.length < 2 ? { rate: 1.33 } : {})];
+        hits.lotom = [Object.assign(makeHit(best[best.length - 1], 'lotom', 0, true), best.length < 2 ? { rate: 0.75 } : {})];
       }
-      hits[c] = pool.map((f, i) => makeHit(f, c, i, borrowed));
+      for (const c of CLASSES) {
+        if (hits[c].length) continue;
+        const sk = c === 'hitom' || c === 'lotom' ? 'tom' : c;
+        hits[c] = list.slice().sort((a, b) => b.scores[sk] - a.scores[sk]).slice(0, Math.min(2, list.length)).map((f, i) => makeHit(f, c, i, true));
+      }
     }
     S.hits = hits;
   }
@@ -308,7 +381,7 @@
     dur = Math.min(dur, Math.max(0.05, S.buffer.duration - f.t - 0.01));
     const peak = peakRange(S.mono, f.s, f.s + dur * sr) || 1e-3;
     const prev = (S._hitState || {})[cls + ':' + f.t.toFixed(3)];
-    return { cls, t: f.t, dur, rank: f.rank, strength: f.strength, clean: f.clean, gain: clamp(0.7 / peak, 0.3, 10),
+    return { _f: f, rate: 1, cls, t: f.t, dur, rank: f.rank, strength: f.strength, clean: f.clean, gain: clamp(0.7 / peak, 0.3, 10),
       on: prev ? prev.on : true, borrowed, n: i + 1, key: cls + ':' + f.t.toFixed(3) };
   }
   function allHits() { return CLASSES.flatMap((c) => S.hits[c]); }
@@ -399,7 +472,7 @@
     try { const d = sigCtx.getImageData(0, 0, 16, 16).data; const o = new Uint8Array(768); for (let i = 0, j = 0; i < d.length; i += 4) { o[j++] = d[i]; o[j++] = d[i + 1]; o[j++] = d[i + 2]; } return o; } catch (e) { return null; }
   }
   function sigDiff(a, b) { if (!a || !b) return 255; let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return s / a.length; }
-  const nFrames = (hit) => clamp(Math.ceil(hit.dur * FRAME_FPS), 2, 4);
+  const nFrames = (hit) => clamp(Math.ceil(hit.dur * FRAME_FPS), 2, 3);
   const frameKey = (hit) => hit.t.toFixed(3) + ':' + nFrames(hit);
   const frameTimes = (hit) => Array.from({ length: nFrames(hit) }, (_, k) => hit.t + 0.01 + k / FRAME_FPS);
 
@@ -522,20 +595,27 @@
   $('#btnDbgSeek') && ($('#btnDbgSeek').onclick = () => { S.captureMode = FORCE_CAPTURE || null; S.frameCache.clear(); extractAllFrames(); });
 
   // ---------- drawing ----------
+  // Per-hit cut effects (used by both the live preview and the exported render).
+  // Toned down ~45% (v3): was zoom kick .08/snare .04/hat .015, decay 10/s; flash .40/.32/.16, decay 14/s; pulse .6 @ 8/s.
+  const FX = {
+    zoom: { kick: 0.045, lotom: 0.033, hitom: 0.028, snare: 0.022, clap: 0.022, rim: 0.011, hat: 0.008 }, zoomDefault: 0.017, zoomDecay: 16,
+    flash: { kick: 0.22, hitom: 0.22, lotom: 0.22, snare: 0.18, clap: 0.18, rim: 0.11, hat: 0.09 }, flashDefault: 0.22, flashDecay: 22,
+    pulse: 0.33, pulseDecay: 13,
+  };
   function drawHitFrame(hit, dt, step) {
     const W = stage.width, H = stage.height; const fr = hit && hit.frames;
     sctx.save(); sctx.fillStyle = '#000'; sctx.fillRect(0, 0, W, H);
-    let z = 1; if (S.fx && hit) z = 1 + (hit.cls === 'kick' ? 0.08 : hit.cls === 'snare' ? 0.04 : 0.015) * Math.exp(-Math.max(0, dt) * 10);
+    let z = 1; if (S.fx && hit) z = 1 + (FX.zoom[hit.cls] || FX.zoomDefault) * Math.exp(-Math.max(0, dt) * FX.zoomDecay);
     if (fr && fr.length) {
       const img = fr[clamp(Math.floor(Math.max(0, dt) * FRAME_FPS), 0, fr.length - 1)];
       const dw = W * z, dh = H * z; sctx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
     } else if (hit) { // audio-only source: simple generative visual
-      const r = Math.min(W, H) * 0.25 * z * (1 + 0.6 * Math.exp(-Math.max(0, dt) * 8));
+      const r = Math.min(W, H) * 0.25 * z * (1 + FX.pulse * Math.exp(-Math.max(0, dt) * FX.pulseDecay));
       sctx.fillStyle = COLOR[hit.cls]; sctx.globalAlpha = 0.85; sctx.beginPath(); sctx.arc(W / 2, H / 2, r, 0, Math.PI * 2); sctx.fill(); sctx.globalAlpha = 1;
     }
     if (S.fx && hit && dt >= 0) {
-      const a = (hit.cls === 'hat' ? 0.16 : hit.cls === 'snare' ? 0.32 : 0.4) * Math.exp(-dt * 14);
-      if (a > 0.01) { sctx.globalAlpha = a; sctx.fillStyle = hit.cls === 'snare' ? '#ffffff' : COLOR[hit.cls]; sctx.fillRect(0, 0, W, H); sctx.globalAlpha = 1; }
+      const a = (FX.flash[hit.cls] || FX.flashDefault) * Math.exp(-dt * FX.flashDecay);
+      if (a > 0.01) { sctx.globalAlpha = a; sctx.fillStyle = hit.cls === 'snare' || hit.cls === 'clap' ? '#ffffff' : COLOR[hit.cls]; sctx.fillRect(0, 0, W, H); sctx.globalAlpha = 1; }
     }
     if (S.fx && step != null) { // step dots
       const n = 16, gap = Math.max(2, W * 0.006), dw = (W * 0.6 - gap * (n - 1)) / n, y = H - Math.max(8, H * 0.035) - 4, x0 = W * 0.2;
@@ -566,7 +646,7 @@
     for (const h of allHits()) {
       const px = (h.t / dur) * W; wctx.globalAlpha = h.on ? 1 : 0.35;
       wctx.fillStyle = COLOR[h.cls]; wctx.fillRect(px, 0, Math.max(1.5, 1.5 * dpr), H);
-      const ry = h.cls === 'kick' ? H - 9 * dpr : h.cls === 'snare' ? H / 2 : 9 * dpr;
+      const ry = 9 * dpr + (H - 18 * dpr) * (1 - CLASSES.indexOf(h.cls) / (CLASSES.length - 1));
       wctx.beginPath(); wctx.arc(px, ry, (S.sel === h ? 7 : 5) * dpr, 0, Math.PI * 2); wctx.fill();
       if (S.sel === h) { wctx.strokeStyle = '#fff'; wctx.lineWidth = 2 * dpr; wctx.stroke(); }
     }
@@ -603,13 +683,16 @@
   // ---------- sequencer ----------
   function emptyPat() { const p = {}; CLASSES.forEach((c) => (p[c] = new Array(16).fill(false))); return p; }
   function patFrom(o) { const p = emptyPat(); for (const c of CLASSES) (o[c] || []).forEach((i) => (p[c][i] = true)); return p; }
-  function defaultPattern() { return patFrom({ kick: [0, 7, 10], snare: [4, 12], hat: [0, 2, 4, 6, 8, 10, 12, 14] }); }
+  function defaultPattern() { return patFrom({ kick: [0, 7, 10], snare: [4, 12], hat: [0, 2, 4, 6, 8, 10, 12, 14], clap: [12], rim: [3, 11] }); }
   function randomPattern() {
     const p = emptyPat(); const r = Math.random;
     p.kick[0] = true; const kp = { 2: 0.15, 3: 0.25, 6: 0.3, 7: 0.35, 8: 0.45, 10: 0.5, 11: 0.25, 13: 0.15, 14: 0.2 };
     for (const k in kp) if (r() < kp[k]) p.kick[k] = true;
     p.snare[4] = p.snare[12] = true; const sp = { 7: 0.1, 9: 0.12, 14: 0.1, 15: 0.25 };
     for (const k in sp) if (r() < sp[k]) p.snare[k] = true;
+    if (r() < 0.5) { p.clap[12] = true; if (r() < 0.5) p.clap[4] = true; } else if (r() < 0.4) p.clap[r() < 0.5 ? 13 : 15] = true;
+    for (const k of [3, 6, 9, 11, 14]) if (r() < 0.22) p.rim[k] = true;
+    if (r() < 0.35) { p.hitom[13] = true; p.lotom[r() < 0.5 ? 14 : 15] = true; }
     const mode = r();
     for (let i = 0; i < 16; i++) {
       if (mode < 0.45) p.hat[i] = i % 2 === 0;
@@ -619,10 +702,17 @@
     }
     return p;
   }
-  function makeFill(p) { const f = { kick: p.kick.slice(), snare: p.snare.slice(), hat: p.hat.slice() }; [12, 13, 14, 15].forEach((i) => { f.snare[i] = i !== 12 || f.snare[12]; f.hat[i] = false; }); f.snare[13] = f.snare[14] = f.snare[15] = true; f.kick[12] = true; return f; }
+  // Last bar: hi-to-lo tom roll into a snare/clap pickup.
+  function makeFill(p) {
+    const f = perClass((c) => p[c].slice());
+    for (let i = 8; i < 16; i++) for (const c of ['snare', 'hat', 'clap', 'rim', 'hitom', 'lotom']) f[c][i] = false;
+    [8, 9, 10].forEach((i) => (f.hitom[i] = true)); [11, 12, 13].forEach((i) => (f.lotom[i] = true));
+    f.kick[8] = true; f.kick[12] = true; f.snare[14] = f.snare[15] = true; f.clap[15] = true; f.hat[8] = true;
+    return f;
+  }
   function setPattern(p) { S.pattern = p; S.fillPattern = makeFill(p); renderGrid(); }
 
-  const gridEl = $('#grid'); const cells = { kick: [], snare: [], hat: [] };
+  const gridEl = $('#grid'); const cells = perClass(() => []);
   function buildGrid() {
     gridEl.innerHTML = '';
     for (const c of CLASSES) {
@@ -651,14 +741,18 @@
     g.gain.setValueAtTime(pk, when + dur * 0.55); g.gain.linearRampToValueAtTime(0, when + dur);
     let node = src;
     if (S.eq) {
-      const f = c.createBiquadFilter();
-      if (hit.cls === 'kick') { f.type = 'lowshelf'; f.frequency.value = 120; f.gain.value = 6; const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3500; node.connect(lp); node = lp; }
-      else if (hit.cls === 'snare') { f.type = 'peaking'; f.frequency.value = 220; f.Q.value = 1; f.gain.value = 3; }
+      const f = c.createBiquadFilter(); const k = hit.cls;
+      if (k === 'kick') { f.type = 'lowshelf'; f.frequency.value = 120; f.gain.value = 6; const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3500; node.connect(lp); node = lp; }
+      else if (k === 'snare') { f.type = 'peaking'; f.frequency.value = 220; f.Q.value = 1; f.gain.value = 3; }
+      else if (k === 'clap') { f.type = 'peaking'; f.frequency.value = 1500; f.Q.value = 0.8; f.gain.value = 3; }
+      else if (k === 'hitom' || k === 'lotom') { f.type = 'lowshelf'; f.frequency.value = k === 'lotom' ? 160 : 260; f.gain.value = 3; }
+      else if (k === 'rim') { f.type = 'highpass'; f.frequency.value = 400; f.Q.value = 0.7; }
       else { f.type = 'highpass'; f.frequency.value = 2500; f.Q.value = 0.7; }
       node.connect(f); node = f;
     }
     node.connect(g); g.connect(master);
-    src.start(when, Math.max(0, hit.t - 0.002), dur + 0.01);
+    const rate = hit.rate || 1; if (rate !== 1) src.playbackRate.value = rate; // borrowed toms are pitch-shifted
+    src.start(when, Math.max(0, hit.t - 0.002), (dur + 0.01) * rate);
     const prev = choke[hit.cls];
     if (prev && prev.end > when && prev.when < when) { try { prev.g.gain.cancelScheduledValues(when); prev.g.gain.setTargetAtTime(0, when, 0.004); } catch (e) { /* ignore */ } }
     choke[hit.cls] = { g, when, end: when + dur };
@@ -672,7 +766,7 @@
     const c = audio();
     const lookahead = opts.render ? 0.6 : 0.15;
     const t0 = c.currentTime + (opts.lead || 0.12);
-    const P = { id: Math.random(), t0, nextStep: 0, nextTime: t0, nodes: [], vis: [], steps: [], occ: { kick: 0, snare: 0, hat: 0 },
+    const P = { id: Math.random(), t0, nextStep: 0, nextTime: t0, nodes: [], vis: [], steps: [], occ: perClass(() => 0),
       loop: !opts.render && S.loop, totalSteps: S.bars * 16, endTime: null, render: !!opts.render, onEnd: opts.onEnd, onTick: opts.onTick };
     S.play = P;
     const schedule = () => {
@@ -680,7 +774,7 @@
       const now = c.currentTime;
       while (P.nextTime < now + lookahead && P.endTime == null) {
         if (P.nextStep >= P.totalSteps) {
-          if (P.loop) { P.nextStep = 0; P.occ = { kick: 0, snare: 0, hat: 0 }; } else { P.endTime = P.nextTime; break; }
+          if (P.loop) { P.nextStep = 0; P.occ = perClass(() => 0); } else { P.endTime = P.nextTime; break; }
         }
         const step = P.nextStep % 16, bar = Math.floor(P.nextStep / 16);
         const pat = S.fill && S.bars > 1 && bar === S.bars - 1 ? S.fillPattern : S.pattern;
@@ -842,8 +936,8 @@
       await extractAllFrames((p) => setProgress(0.75 + 0.25 * p));
       setProgress(null);
       drawHitFrame(usable('kick')[0] || allHits()[0], 1, null);
-      const n = S.hits.kick.length + S.hits.snare.length + S.hits.hat.length;
-      toast(`Found ${S.onsets.length} hits · using ${S.hits.kick.length} kick, ${S.hits.snare.length} snare, ${S.hits.hat.length} hat` + (n ? '. Press Play!' : ''));
+      const n = allHits().length;
+      toast(`Found ${S.onsets.length} hits · ` + CLASSES.map((c) => `${S.hits[c].length} ${LABEL[c].toLowerCase()}`).join(', ') + (n ? '. Press Play!' : ''), false, 4500);
       S.ready = true;
     } catch (e) {
       console.error(e); setProgress(null); showCapturing(false); toast((e && e.message) || 'Could not analyze this video.', true);
